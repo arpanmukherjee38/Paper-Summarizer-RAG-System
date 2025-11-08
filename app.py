@@ -2,25 +2,21 @@ import streamlit as st
 import json
 import faiss
 import numpy as np
-import requests
+import os
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-import os
 
-# --- App Configuration ---
+import google.generativeai as genai
+genai.configure(api_key="AIzaSyBrUfmyKFDyNOYbNzMZCqXoie1_SAS4h0E")   # <-- put your google API here later
+
 st.set_page_config(
     page_title="Academic Paper Summarizer",
     page_icon="📚",
     layout="wide"
 )
 
-# --- Backend Logic (Functions from your scripts) ---
-
-# This function builds the knowledge base. We use a Streamlit cache to avoid re-running it
-# every time the app reloads, which saves a lot of time.
 @st.cache_resource
 def build_index(pdf_path, embed_model_name):
-    """Reads a PDF, chunks it, creates embeddings, and builds a FAISS index."""
     try:
         reader = PdfReader(pdf_path)
         text = "".join(page.extract_text() for page in reader.pages)
@@ -47,74 +43,51 @@ def build_index(pdf_path, embed_model_name):
         st.error(f"An error occurred during indexing: {e}")
         return None, None
 
-def generate_summary(query, index, chunks, embed_model, ollama_model):
-    """Performs RAG to generate a summary."""
+def generate_summary(query, index, chunks, embed_model):
     try:
         embedder = SentenceTransformer(embed_model)
         query_vector = embedder.encode([query], convert_to_numpy=True)
         faiss.normalize_L2(query_vector)
 
-        k = 4  # Retrieve top 4 relevant chunks
+        k = 4
         distances, indices = index.search(query_vector, k)
         retrieved_chunks = [chunks[i] for i in indices[0]]
         context = "\n\n".join(retrieved_chunks)
 
         prompt = f"""
         Based ONLY on the following context from an academic paper, answer the user's question.
-        If the context doesn't contain the answer, state that you cannot answer based on the provided text.
-        The answer should be a concise summary.
+        If the context doesn't contain the answer, say you cannot answer.
 
         --- CONTEXT ---
         {context}
-        --- END OF CONTEXT ---
+        --- END CONTEXT ---
 
         QUESTION: {query}
 
         ANSWER:
         """
 
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model": ollama_model, "prompt": prompt, "stream": False},
-            timeout=120
-        )
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Could not connect to Ollama. Is 'ollama serve' running? Error: {e}")
-        return None
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        return response.text.strip()
+
     except Exception as e:
         st.error(f"An error occurred during generation: {e}")
         return None
 
-# --- Frontend UI using Streamlit ---
+st.title("📚 Academic Paper Summarizer (Google Gemini)")
+st.markdown("Upload a PDF and ask questions about it.")
 
-st.title("📚 Academic Paper Summarizer")
-st.markdown("Upload a PDF of an academic paper, and this app will use a local AI model to answer your questions about it.")
-
-# --- UI Sidebar for Configuration ---
 with st.sidebar:
-    st.header("Configuration")
-    # Let the user choose which Ollama model to use
-    ollama_model = st.selectbox(
-        "Choose an Ollama Model",
-        ("gemma:2b", "phi-3:mini", "llama3"),
-        index=0  # Default to gemma:2b
-    )
-    st.info("Make sure you have pulled your chosen model in Ollama (e.g., `ollama pull gemma:2b`)")
-    EMBED_MODEL = "all-MiniLM-L6-v2" # Embedding model is fixed for simplicity
+    st.header("AI Settings")
+    EMBED_MODEL = "all-MiniLM-L6-v2"
 
-# --- Main App Logic ---
+uploaded_file = st.file_uploader("Upload PDF", type="pdf")
 
-# 1. File Uploader
-uploaded_file = st.file_uploader("Upload your academic paper (PDF)", type="pdf")
-
-# Use a session state to track if the index is built
 if 'index_built' not in st.session_state:
     st.session_state.index_built = False
 
 if uploaded_file is not None:
-    # Save the uploaded file to a temporary path
     temp_dir = "temp_files"
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
@@ -122,38 +95,29 @@ if uploaded_file is not None:
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # 2. Build Index Button
     if st.button("Process Paper"):
-        with st.spinner("Reading PDF and building knowledge base... This may take a moment."):
-            # Call the backend function to build the index
+        with st.spinner("Building knowledge base..."):
             index, chunks = build_index(file_path, EMBED_MODEL)
             if index is not None and chunks is not None:
-                # Save the results in the session state to use later
                 st.session_state.faiss_index = index
                 st.session_state.text_chunks = chunks
                 st.session_state.index_built = True
-                st.success("Paper processed! You can now ask questions about it.")
+                st.success("Ready! Now ask a question.")
             else:
-                st.session_state.index_built = False # Ensure state is reset on failure
+                st.session_state.index_built = False
 
-    # 3. Query Input and Summarization
     if st.session_state.index_built:
         st.markdown("---")
         st.header("Ask a Question")
-        query = st.text_area(
-            "Enter your question or ask for a summary",
-            "What is the main conclusion of this paper?"
-        )
+        query = st.text_area("Ask something:", "What is the main conclusion?")
 
         if st.button("Generate Summary"):
-            with st.spinner(f"Generating summary with '{ollama_model}'..."):
-                # Retrieve the index and chunks from the session state
+            with st.spinner("Generating answer using Gemini..."):
                 index = st.session_state.faiss_index
                 chunks = st.session_state.text_chunks
-                # Call the RAG function to get the answer
-                summary = generate_summary(query, index, chunks, EMBED_MODEL, ollama_model)
+                summary = generate_summary(query, index, chunks, EMBED_MODEL)
                 if summary:
-                    st.success("Summary Generated!")
+                    st.success("Answer:")
                     st.markdown(summary)
 else:
-    st.session_state.index_built = False # Reset state if no file is uploaded
+    st.session_state.index_built = False
